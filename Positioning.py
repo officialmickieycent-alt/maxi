@@ -366,7 +366,7 @@ class Storage:
             print(f"[storage] load_snapshot failed: {e}")
             return None, None, None
 
-        def info(self):
+    def info(self):
         return {
             "connected": self.connected,
             "database": self.db.name if self.db is not None else None,
