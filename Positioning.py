@@ -27,11 +27,13 @@ if _HERE not in sys.path:
 import io
 import math
 import threading
+import time
 from datetime import datetime
 
 import numpy as np
 import pandas as pd
 from flask import Flask, Response, jsonify, request
+from pymongo import MongoClient
 
 import cot_engine as engine
 
@@ -105,6 +107,8 @@ class Cache:
         self.loading = False
         self.error = None
         self.version = 0
+        self.data_source = None      # 'mongo' or 'engine'
+        self.storage = Storage()
 
     @property
     def ready(self):
@@ -124,7 +128,34 @@ class Cache:
         if not os.path.exists(processed):
             engine.process_data()
 
-    def _build(self):
+    def _try_mongo(self):
+        """Return True if a fresh snapshot was loaded from Mongo."""
+        if not self.storage.connected:
+            return False
+        print("[cache] Trying Mongo snapshot...")
+        currency_df, pair_df, _meta = self.storage.load_snapshot()
+        if currency_df is None or currency_df.empty:
+            print("[cache] Mongo empty — will run engine")
+            return False
+        latest = currency_df["report_date"].max()
+        days_old = (datetime.now() - latest).days
+        print(f"[cache] Mongo snapshot: latest report {latest.date()}, "
+              f"{days_old} days old, {len(currency_df)} currency rows")
+        if days_old > 10:
+            print("[cache] Mongo snapshot is stale — will run engine")
+            return False
+        self.currency_df = currency_df
+        self.pair_df = pair_df
+        self.loaded_at = datetime.now()
+        self.data_source = "mongo"
+        self.version += 1
+        self.error = None
+        print(f"[cache] Loaded from Mongo: {len(currency_df)} + {len(pair_df)} rows")
+        return True
+
+    def _build_from_engine(self):
+        """Run the engine end-to-end and repopulate the cache."""
+        print("[cache] Running engine...")
         self._ensure_files()
         processed = os.path.join(
             engine.CONFIG["processed_dir"], "cot_currency_weekly.csv"
@@ -134,47 +165,46 @@ class Cache:
 
         currency_df = pd.read_csv(processed, parse_dates=["report_date"])
         currency_df = currency_df.sort_values(
-            ["currency", "report_date"]
-        ).reset_index(drop=True)
+            ["currency", "report_date"]).reset_index(drop=True)
 
         pair_history = engine.generate_pair_history(
             currency_df, engine.CANONICAL_PAIRS
         )
         if not pair_history.empty:
             pair_history = engine.calculate_pair_trajectory(
-                pair_history, periods=[1, 4, 12]
-            )
+                pair_history, periods=[1, 4, 12])
             pair_history["nc_status"] = pair_history["nc_diff"].apply(
-                engine.classify_pair_status
-            )
+                engine.classify_pair_status)
             pair_history["comm_status"] = pair_history["comm_diff"].apply(
-                engine.classify_pair_status
-            )
+                engine.classify_pair_status)
             pair_history["nr_status"] = pair_history["nr_diff"].apply(
-                engine.classify_pair_status
-            )
+                engine.classify_pair_status)
             pair_history["opposition"] = pair_history.apply(
                 lambda r: engine.classify_opposition(r["nc_diff"], r["comm_diff"]),
-                axis=1,
-            )
+                axis=1)
             pair_history["nc_trajectory"] = pair_history[
-                "nc_diff_4w_change"
-            ].apply(engine.classify_trajectory)
+                "nc_diff_4w_change"].apply(engine.classify_trajectory)
             pair_history["comm_trajectory"] = pair_history[
-                "comm_diff_4w_change"
-            ].apply(engine.classify_trajectory)
+                "comm_diff_4w_change"].apply(engine.classify_trajectory)
             pair_history["context"] = pair_history.apply(
-                engine.classify_positioning_context, axis=1
-            )
+                engine.classify_positioning_context, axis=1)
             pair_history = pair_history.sort_values(
-                ["pair", "report_date"]
-            ).reset_index(drop=True)
+                ["pair", "report_date"]).reset_index(drop=True)
 
         self.currency_df = currency_df
         self.pair_df = pair_history
         self.loaded_at = datetime.now()
+        self.data_source = "engine"
         self.version += 1
         self.error = None
+
+        if self.storage.connected:
+            self.storage.save_snapshot(currency_df, pair_history)
+
+    def _build(self):
+        if self._try_mongo():
+            return
+        self._build_from_engine()
 
     def load(self):
         if self.loading:
@@ -185,6 +215,7 @@ class Cache:
                 self._build()
         except Exception as e:
             self.error = str(e)
+            print(f"[cache] Load failed: {e}")
         finally:
             self.loading = False
 
@@ -196,13 +227,146 @@ class Cache:
             with self.lock:
                 engine.download_all()
                 engine.process_data()
-                self._build()
+                self._build_from_engine()
             return True
         except Exception as e:
             self.error = str(e)
             return False
         finally:
             self.loading = False
+            
+            
+# ======================================================================
+# MongoDB storage layer — persists engine output across ephemeral restarts
+# ======================================================================
+class Storage:
+    """Wraps a small, fixed set of MongoDB collections.
+
+    If MONGO_URI is not set, or the connection fails, the app falls back
+    to disk-only behaviour identical to the pre-Mongo version. This means
+    local development works without a running MongoDB instance.
+    """
+
+    def __init__(self):
+        self.client = None
+        self.db = None
+        self.connected = False
+        self.last_error = None
+        self._connect()
+
+    def _connect(self):
+        uri = os.environ.get("MONGO_URI")
+        if not uri:
+            print("[storage] MONGO_URI not set — disk-only mode")
+            return
+        db_name = os.environ.get("MONGO_DB", "fx_intel")
+        try:
+            self.client = MongoClient(uri, serverSelectionTimeoutMS=8000)
+            self.client.admin.command("ping")
+            self.db = self.client[db_name]
+            self.connected = True
+            print(f"[storage] Connected to MongoDB database '{db_name}'")
+        except Exception as e:
+            self.last_error = str(e)
+            print(f"[storage] Mongo connection failed: {e}")
+            self.client = None
+            self.db = None
+
+    @staticmethod
+    def _df_to_records(df):
+        if df is None or df.empty:
+            return []
+        records = df.to_dict(orient="records")
+        for rec in records:
+            for k, v in list(rec.items()):
+                if isinstance(v, pd.Timestamp):
+                    rec[k] = None if pd.isna(v) else v.strftime("%Y-%m-%d")
+                elif isinstance(v, (np.integer,)):
+                    rec[k] = int(v)
+                elif isinstance(v, (np.floating,)):
+                    rec[k] = None if (np.isnan(v) or np.isinf(v)) else float(v)
+                elif isinstance(v, float) and (math.isnan(v) or math.isinf(v)):
+                    rec[k] = None
+                elif isinstance(v, np.bool_):
+                    rec[k] = bool(v)
+        return records
+
+    def save_snapshot(self, currency_df, pair_df):
+        if not self.connected:
+            return False
+        try:
+            currency_records = self._df_to_records(currency_df)
+            pair_records = self._df_to_records(pair_df)
+            latest_report = (
+                currency_df["report_date"].max().strftime("%Y-%m-%d")
+                if currency_df is not None and not currency_df.empty else None
+            )
+            now = datetime.utcnow()
+            self.db.currency_history.replace_one(
+                {"_id": "snapshot"},
+                {"_id": "snapshot", "rows": currency_records,
+                 "row_count": len(currency_records),
+                 "latest_report_date": latest_report, "updated_at": now},
+                upsert=True,
+            )
+            self.db.pair_history.replace_one(
+                {"_id": "snapshot"},
+                {"_id": "snapshot", "rows": pair_records,
+                 "row_count": len(pair_records), "updated_at": now},
+                upsert=True,
+            )
+            self.db.metadata.replace_one(
+                {"_id": "status"},
+                {"_id": "status", "latest_report_date": latest_report,
+                 "updated_at": now,
+                 "currency_rows": len(currency_records),
+                 "pair_rows": len(pair_records)},
+                upsert=True,
+            )
+            print(f"[storage] Saved {len(currency_records)} currency rows, "
+                  f"{len(pair_records)} pair rows to Mongo")
+            return True
+        except Exception as e:
+            self.last_error = str(e)
+            print(f"[storage] save_snapshot failed: {e}")
+            return False
+
+    def load_snapshot(self):
+        if not self.connected:
+            return None, None, None
+        try:
+            currency_doc = self.db.currency_history.find_one({"_id": "snapshot"})
+            pair_doc = self.db.pair_history.find_one({"_id": "snapshot"})
+            if not currency_doc or not pair_doc:
+                return None, None, None
+            currency_df = pd.DataFrame(currency_doc["rows"])
+            pair_df = pd.DataFrame(pair_doc["rows"])
+            if not currency_df.empty and "report_date" in currency_df.columns:
+                currency_df["report_date"] = pd.to_datetime(currency_df["report_date"])
+                currency_df = currency_df.sort_values(
+                    ["currency", "report_date"]).reset_index(drop=True)
+            if not pair_df.empty and "report_date" in pair_df.columns:
+                pair_df["report_date"] = pd.to_datetime(pair_df["report_date"])
+                pair_df = pair_df.sort_values(
+                    ["pair", "report_date"]).reset_index(drop=True)
+            meta = {
+                "updated_at": currency_doc.get("updated_at"),
+                "latest_report_date": currency_doc.get("latest_report_date"),
+                "currency_rows": len(currency_df),
+                "pair_rows": len(pair_df),
+            }
+            return currency_df, pair_df, meta
+        except Exception as e:
+            self.last_error = str(e)
+            print(f"[storage] load_snapshot failed: {e}")
+            return None, None, None
+
+    def info(self):
+        return {
+            "connected": self.connected,
+            "database": self.db.name if self.db else None,
+            "last_error": self.last_error,
+        }
 
 
 CACHE = Cache()
@@ -372,13 +536,41 @@ def _slice_period(df, period, date_col="report_date"):
 # ======================================================================
 @app.route("/api/status")
 def api_status():
+    report_date = None
+    if CACHE.ready:
+        report_date = _clean(CACHE.currency_df["report_date"].max())
     return jsonify({
         "ready": CACHE.ready,
         "loading": CACHE.loading,
         "error": CACHE.error,
         "loaded_at": _clean(CACHE.loaded_at) if CACHE.loaded_at else None,
+        "report_date": report_date,
+        "data_source": CACHE.data_source,
         "version": CACHE.version,
+        "storage": CACHE.storage.info(),
     })
+
+
+@app.route("/api/cache-info")
+def api_cache_info():
+    info = {
+        "ready": CACHE.ready,
+        "loading": CACHE.loading,
+        "data_source": CACHE.data_source,
+        "loaded_at": _clean(CACHE.loaded_at) if CACHE.loaded_at else None,
+        "storage": CACHE.storage.info(),
+    }
+    if CACHE.ready:
+        latest = CACHE.currency_df["report_date"].max()
+        days_old = (datetime.now() - latest).days
+        info["latest_report_date"] = _clean(latest)
+        info["days_old"] = days_old
+        info["currency_rows"] = len(CACHE.currency_df)
+        info["pair_rows"] = len(CACHE.pair_df)
+        info["currencies"] = sorted(
+            CACHE.currency_df["currency"].unique().tolist())
+        info["pairs_count"] = int(CACHE.pair_df["pair"].nunique())
+    return jsonify(info)
 
 
 @app.route("/api/refresh", methods=["POST"])
@@ -1923,15 +2115,32 @@ def _initial_load():
     CACHE.load()
 
 
+# Start the load thread at module level so it runs under gunicorn
+# (imported as `Positioning`) as well as under `python Positioning.py`.
+_load_thread_lock = threading.Lock()
+_load_thread_started = False
+
+
+def _ensure_load_started():
+    global _load_thread_started
+    with _load_thread_lock:
+        if _load_thread_started:
+            return
+        _load_thread_started = True
+    threading.Thread(target=_initial_load, daemon=True).start()
+
+
+_ensure_load_started()
+
+
 if __name__ == "__main__":
     try:
         os.chdir(_HERE)
     except Exception:
         pass
-
-    threading.Thread(target=_initial_load, daemon=True).start()
-
+    port = int(os.environ.get("PORT", PORT))
+    host = "0.0.0.0" if os.environ.get("PORT") else HOST
     print("\n  FX Positioning Intelligence Terminal")
-    print(f"  -> http://{HOST}:{PORT}\n")
-
-    app.run(host=HOST, port=PORT, debug=DEBUG, threaded=True, use_reloader=False)
+    print(f"  -> http://{host}:{port}\n")
+    app.run(host=host, port=port, debug=DEBUG,
+            threaded=True, use_reloader=False)
