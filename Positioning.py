@@ -34,6 +34,7 @@ import numpy as np
 import pandas as pd
 from flask import Flask, Response, jsonify, request
 from pymongo import MongoClient
+import certifi
 
 import cot_engine as engine
 
@@ -261,7 +262,11 @@ class Storage:
             return
         db_name = os.environ.get("MONGO_DB", "fx_intel")
         try:
-            self.client = MongoClient(uri, serverSelectionTimeoutMS=8000)
+            self.client = MongoClient(
+                uri,
+                tlsCAFile=certifi.where(),
+                serverSelectionTimeoutMS=8000,
+            )
             self.client.admin.command("ping")
             self.db = self.client[db_name]
             self.connected = True
