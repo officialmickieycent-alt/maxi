@@ -130,29 +130,29 @@ class Cache:
             engine.process_data()
 
     def _try_mongo(self):
-        """Return True if a fresh snapshot was loaded from Mongo."""
-        if not self.storage.connected:
-            return False
-        print("[cache] Trying Mongo snapshot...")
-        currency_df, pair_df, _meta = self.storage.load_snapshot()
-        if currency_df is None or currency_df.empty:
-            print("[cache] Mongo empty — will run engine")
-            return False
-        latest = currency_df["report_date"].max()
-        days_old = (datetime.now() - latest).days
-        print(f"[cache] Mongo snapshot: latest report {latest.date()}, "
-              f"{days_old} days old, {len(currency_df)} currency rows")
-        if days_old > 10:
-            print("[cache] Mongo snapshot is stale — will run engine")
-            return False
-        self.currency_df = currency_df
-        self.pair_df = pair_df
-        self.loaded_at = datetime.now()
-        self.data_source = "mongo"
-        self.version += 1
-        self.error = None
-        print(f"[cache] Loaded from Mongo: {len(currency_df)} + {len(pair_df)} rows")
-        return True
+       """Return True if a fresh snapshot was loaded from Turso."""
+       if not self.storage.connected:
+           return False
+       print("[cache] Trying Turso snapshot...", flush=True)
+       currency_df, pair_df, _meta = self.storage.load_snapshot()
+       if currency_df is None or currency_df.empty:
+          print("[cache] Turso empty — will run engine", flush=True)
+          return False
+       latest = currency_df["report_date"].max()
+       days_old = (datetime.now() - latest).days
+       print(f"[cache] Turso snapshot: latest report {latest.date()}, "
+             f"{days_old} days old, {len(currency_df)} currency rows", flush=True)
+       if days_old > 10:
+           print("[cache] Turso snapshot is stale — will run engine", flush=True)
+           return False
+       self.currency_df = currency_df
+       self.pair_df = pair_df
+       self.loaded_at = datetime.now()
+       self.data_source = "turso"
+       self.version += 1
+       self.error = None
+       print(f"[cache] Loaded from Turso: {len(currency_df)} + {len(pair_df)} rows", flush=True)
+       return True
 
     def _build_from_engine(self):
         """Run the engine end-to-end and repopulate the cache."""
@@ -222,16 +222,26 @@ class Cache:
 
     def refresh(self):
         if self.loading:
-            return False
+           return False
         self.loading = True
         try:
-            with self.lock:
-                engine.download_all()
-                engine.process_data()
-                self._build_from_engine()
-            return True
+           with self.lock:
+                if self.storage.connected:
+                    currency_df, pair_df, _ = self.storage.load_snapshot()
+                    if currency_df is not None and not currency_df.empty:
+                       self.currency_df = currency_df
+                       self.pair_df = pair_df
+                       self.loaded_at = datetime.now()
+                       self.data_source = "turso"
+                       self.version += 1
+                       self.error = None
+                       print(f"[cache] Refreshed from Turso: {len(currency_df)} + {len(pair_df)} rows", flush=True)
+                       return True
+                print("[cache] Refresh: no data available in Turso", flush=True)
+                return False
         except Exception as e:
             self.error = str(e)
+            print(f"[cache] Refresh failed: {e}", flush=True)
             return False
         finally:
             self.loading = False
@@ -242,7 +252,6 @@ class Cache:
 # ======================================================================
 class Storage:
     def __init__(self):
-        self.conn = None
         self.connected = False
         self.last_error = None
         self._url = None
@@ -258,58 +267,43 @@ class Storage:
         self._url = url
         self._token = token
         try:
-            self.conn = libsql.connect(database=url, auth_token=token)
-            self.conn.execute("SELECT 1")
+            conn = libsql.connect(database=url, auth_token=token)
+            conn.execute("SELECT 1")
+            try:
+                conn.close()
+            except Exception:
+                pass
             self.connected = True
             print("[storage] Connected to Turso database", flush=True)
         except Exception as e:
             self.last_error = str(e)
             print(f"[storage] Turso connection failed: {e}", flush=True)
-            self.conn = None
 
-    def _reconnect(self):
-        url = os.environ.get("TURSO_DATABASE_URL")
-        token = os.environ.get("TURSO_AUTH_TOKEN")
-        """Open a fresh Hrana stream. Turso rolls back idle interactive
-        transactions after ~10s, so we always reopen right before I/O."""
-        if self._url is None or self._token is None:
-            return
-        if self.conn is not None:
-            try:
-                self.conn.commit()
-            except Exception:
-                pass
-            try:
-                self.conn.close()
-            except Exception:
-                pass
-        self.conn = libsql.connect(
-            database=url,
-            auth_token=token,
-        )
+    def _new_conn(self):
+        """Open a fresh Hrana stream. One per operation — never shared across threads."""
+        return libsql.connect(database=self._url, auth_token=self._token)
 
     def save_snapshot(self, currency_df, pair_df):
         if not self.connected:
             return False
+        conn = None
         try:
-            # Serialize FIRST — no SQL traffic during compression
+            # Serialize to Parquet FIRST — no SQL traffic during compression
             cur_buf = io.BytesIO()
             currency_df.to_parquet(cur_buf, index=False)
             pair_buf = io.BytesIO()
             pair_df.to_parquet(pair_buf, index=False)
             cur_blob = cur_buf.getvalue()
             pair_blob = pair_buf.getvalue()
-
             latest_report = (
                 currency_df["report_date"].max().strftime("%Y-%m-%d")
                 if not currency_df.empty else None
             )
             now = datetime.now(timezone.utc).isoformat()
 
-            # Fresh stream — engine may have been silent for 30s+
-            self._reconnect()
+            conn = self._new_conn()
 
-            self.conn.execute("""
+            conn.execute("""
                 CREATE TABLE IF NOT EXISTS currency_snapshot (
                     id INTEGER PRIMARY KEY,
                     data BLOB,
@@ -317,48 +311,54 @@ class Storage:
                     updated_at TEXT
                 )
             """)
-            self.conn.execute("""
+            conn.execute("""
                 CREATE TABLE IF NOT EXISTS pair_snapshot (
                     id INTEGER PRIMARY KEY,
                     data BLOB,
                     updated_at TEXT
                 )
             """)
-            self.conn.execute("DELETE FROM currency_snapshot WHERE id = 1")
-            self.conn.execute("DELETE FROM pair_snapshot WHERE id = 1")
-            self.conn.execute(
+            conn.execute("DELETE FROM currency_snapshot WHERE id = 1")
+            conn.execute("DELETE FROM pair_snapshot WHERE id = 1")
+            conn.execute(
                 "INSERT INTO currency_snapshot (id, data, latest_report_date, updated_at) "
                 "VALUES (?, ?, ?, ?)",
                 (1, cur_blob, latest_report, now),
             )
-            self.conn.execute(
+            conn.execute(
                 "INSERT INTO pair_snapshot (id, data, updated_at) VALUES (?, ?, ?)",
                 (1, pair_blob, now),
             )
-            self.conn.commit()
+            conn.commit()
             print(f"[storage] Saved snapshots to Turso (latest report: {latest_report})", flush=True)
             return True
         except Exception as e:
             self.last_error = str(e)
             print(f"[storage] save_snapshot failed: {e}", flush=True)
             return False
+        finally:
+            if conn is not None:
+                try:
+                    conn.close()
+                except Exception:
+                    pass
 
     def load_snapshot(self):
         if not self.connected:
             return None, None, None
+        conn = None
         try:
-            # Fresh stream — prevents idle-stream rollback hangs on cold boot
-            self._reconnect()
+            conn = self._new_conn()
 
             print("[storage] load_snapshot: querying currency_snapshot...", flush=True)
-            cur_res = self.conn.execute(
+            cur_res = conn.execute(
                 "SELECT data, latest_report_date, updated_at "
                 "FROM currency_snapshot WHERE id = 1"
             ).fetchone()
             print(f"[storage] load_snapshot: currency row present = {cur_res is not None}", flush=True)
 
             print("[storage] load_snapshot: querying pair_snapshot...", flush=True)
-            pair_res = self.conn.execute(
+            pair_res = conn.execute(
                 "SELECT data, updated_at FROM pair_snapshot WHERE id = 1"
             ).fetchone()
             print(f"[storage] load_snapshot: pair row present = {pair_res is not None}", flush=True)
@@ -368,12 +368,10 @@ class Storage:
                 return None, None, None
 
             print(f"[storage] load_snapshot: decoding currency blob ({len(cur_res[0])} bytes)...", flush=True)
-            cur_buf = io.BytesIO(cur_res[0])
-            currency_df = pd.read_parquet(cur_buf)
+            currency_df = pd.read_parquet(io.BytesIO(cur_res[0]))
 
             print(f"[storage] load_snapshot: decoding pair blob ({len(pair_res[0])} bytes)...", flush=True)
-            pair_buf = io.BytesIO(pair_res[0])
-            pair_df = pd.read_parquet(pair_buf)
+            pair_df = pd.read_parquet(io.BytesIO(pair_res[0]))
 
             if "report_date" in currency_df.columns:
                 currency_df["report_date"] = pd.to_datetime(currency_df["report_date"])
@@ -396,6 +394,12 @@ class Storage:
             self.last_error = str(e)
             print(f"[storage] load_snapshot failed: {e}", flush=True)
             return None, None, None
+        finally:
+            if conn is not None:
+                try:
+                    conn.close()
+                except Exception:
+                    pass
 
     def info(self):
         return {
