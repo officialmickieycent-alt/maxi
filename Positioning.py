@@ -28,7 +28,7 @@ import io
 import math
 import threading
 import time
-from datetime import datetime
+from datetime import datetime,timezone
 
 import numpy as np
 import pandas as pd
@@ -245,34 +245,69 @@ class Storage:
         self.conn = None
         self.connected = False
         self.last_error = None
+        self._url = None
+        self._token = None
         self._connect()
 
     def _connect(self):
         url = os.environ.get("TURSO_DATABASE_URL")
         token = os.environ.get("TURSO_AUTH_TOKEN")
         if not url or not token:
-            print("[storage] TURSO_DATABASE_URL or TURSO_AUTH_TOKEN not set — disk-only mode")
+            print("[storage] TURSO_DATABASE_URL or TURSO_AUTH_TOKEN not set — disk-only mode", flush=True)
             return
+        self._url = url
+        self._token = token
         try:
             self.conn = libsql.connect(database=url, auth_token=token)
-            # Test the connection
             self.conn.execute("SELECT 1")
             self.connected = True
-            print(f"[storage] Connected to Turso database")
+            print("[storage] Connected to Turso database", flush=True)
         except Exception as e:
             self.last_error = str(e)
-            print(f"[storage] Turso connection failed: {e}")
+            print(f"[storage] Turso connection failed: {e}", flush=True)
             self.conn = None
+
+    def _reconnect(self):
+        url = os.environ.get("TURSO_DATABASE_URL")
+        token = os.environ.get("TURSO_AUTH_TOKEN")
+        """Open a fresh Hrana stream. Turso rolls back idle interactive
+        transactions after ~10s, so we always reopen right before I/O."""
+        if self._url is None or self._token is None:
+            return
+        if self.conn is not None:
+            try:
+                self.conn.commit()
+            except Exception:
+                pass
+            try:
+                self.conn.close()
+            except Exception:
+                pass
+        self.conn = libsql.connect(
+            database=url,
+            auth_token=token,
+        )
 
     def save_snapshot(self, currency_df, pair_df):
         if not self.connected:
             return False
         try:
-            # Store DataFrames as Parquet blobs for efficient serialization
+            # Serialize FIRST — no SQL traffic during compression
             cur_buf = io.BytesIO()
             currency_df.to_parquet(cur_buf, index=False)
             pair_buf = io.BytesIO()
             pair_df.to_parquet(pair_buf, index=False)
+            cur_blob = cur_buf.getvalue()
+            pair_blob = pair_buf.getvalue()
+
+            latest_report = (
+                currency_df["report_date"].max().strftime("%Y-%m-%d")
+                if not currency_df.empty else None
+            )
+            now = datetime.now(timezone.utc).isoformat()
+
+            # Fresh stream — engine may have been silent for 30s+
+            self._reconnect()
 
             self.conn.execute("""
                 CREATE TABLE IF NOT EXISTS currency_snapshot (
@@ -289,45 +324,57 @@ class Storage:
                     updated_at TEXT
                 )
             """)
-
-            now = datetime.utcnow().isoformat()
-            latest_report = currency_df["report_date"].max().strftime("%Y-%m-%d") if not currency_df.empty else None
-
             self.conn.execute("DELETE FROM currency_snapshot WHERE id = 1")
-            self.conn.execute(
-                "INSERT INTO currency_snapshot (id, data, latest_report_date, updated_at) VALUES (?, ?, ?, ?)",
-                (1, cur_buf.getvalue(), latest_report, now)
-            )
-
             self.conn.execute("DELETE FROM pair_snapshot WHERE id = 1")
             self.conn.execute(
+                "INSERT INTO currency_snapshot (id, data, latest_report_date, updated_at) "
+                "VALUES (?, ?, ?, ?)",
+                (1, cur_blob, latest_report, now),
+            )
+            self.conn.execute(
                 "INSERT INTO pair_snapshot (id, data, updated_at) VALUES (?, ?, ?)",
-                (1, pair_buf.getvalue(), now)
+                (1, pair_blob, now),
             )
             self.conn.commit()
-            print(f"[storage] Saved snapshots to Turso (latest report: {latest_report})")
+            print(f"[storage] Saved snapshots to Turso (latest report: {latest_report})", flush=True)
             return True
         except Exception as e:
             self.last_error = str(e)
-            print(f"[storage] save_snapshot failed: {e}")
+            print(f"[storage] save_snapshot failed: {e}", flush=True)
             return False
 
     def load_snapshot(self):
         if not self.connected:
             return None, None, None
         try:
-            cur_res = self.conn.execute("SELECT data, latest_report_date, updated_at FROM currency_snapshot WHERE id = 1").fetchone()
-            pair_res = self.conn.execute("SELECT data, updated_at FROM pair_snapshot WHERE id = 1").fetchone()
+            # Fresh stream — prevents idle-stream rollback hangs on cold boot
+            self._reconnect()
+
+            print("[storage] load_snapshot: querying currency_snapshot...", flush=True)
+            cur_res = self.conn.execute(
+                "SELECT data, latest_report_date, updated_at "
+                "FROM currency_snapshot WHERE id = 1"
+            ).fetchone()
+            print(f"[storage] load_snapshot: currency row present = {cur_res is not None}", flush=True)
+
+            print("[storage] load_snapshot: querying pair_snapshot...", flush=True)
+            pair_res = self.conn.execute(
+                "SELECT data, updated_at FROM pair_snapshot WHERE id = 1"
+            ).fetchone()
+            print(f"[storage] load_snapshot: pair row present = {pair_res is not None}", flush=True)
 
             if not cur_res or not pair_res:
+                print("[storage] load_snapshot: snapshot tables empty", flush=True)
                 return None, None, None
 
+            print(f"[storage] load_snapshot: decoding currency blob ({len(cur_res[0])} bytes)...", flush=True)
             cur_buf = io.BytesIO(cur_res[0])
             currency_df = pd.read_parquet(cur_buf)
+
+            print(f"[storage] load_snapshot: decoding pair blob ({len(pair_res[0])} bytes)...", flush=True)
             pair_buf = io.BytesIO(pair_res[0])
             pair_df = pd.read_parquet(pair_buf)
 
-            # Ensure date columns are datetimes
             if "report_date" in currency_df.columns:
                 currency_df["report_date"] = pd.to_datetime(currency_df["report_date"])
             if "report_date" in pair_df.columns:
@@ -339,10 +386,15 @@ class Storage:
                 "currency_rows": len(currency_df),
                 "pair_rows": len(pair_df),
             }
+            print(
+                f"[storage] load_snapshot: OK — {len(currency_df)} currency rows, "
+                f"{len(pair_df)} pair rows",
+                flush=True,
+            )
             return currency_df, pair_df, meta
         except Exception as e:
             self.last_error = str(e)
-            print(f"[storage] load_snapshot failed: {e}")
+            print(f"[storage] load_snapshot failed: {e}", flush=True)
             return None, None, None
 
     def info(self):
