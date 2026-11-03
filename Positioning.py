@@ -33,8 +33,8 @@ from datetime import datetime
 import numpy as np
 import pandas as pd
 from flask import Flask, Response, jsonify, request
-from pymongo import MongoClient
 import certifi
+import libsql
 
 import cot_engine as engine
 
@@ -238,98 +238,74 @@ class Cache:
             
             
 # ======================================================================
-# MongoDB storage layer — persists engine output across ephemeral restarts
+# TursoDB storage layer — persists engine output across ephemeral restarts
 # ======================================================================
 class Storage:
-    """Wraps a small, fixed set of MongoDB collections.
-
-    If MONGO_URI is not set, or the connection fails, the app falls back
-    to disk-only behaviour identical to the pre-Mongo version. This means
-    local development works without a running MongoDB instance.
-    """
-
     def __init__(self):
-        self.client = None
-        self.db = None
+        self.conn = None
         self.connected = False
         self.last_error = None
         self._connect()
 
     def _connect(self):
-        uri = os.environ.get("MONGO_URI")
-        if not uri:
-            print("[storage] MONGO_URI not set — disk-only mode")
+        url = os.environ.get("TURSO_DATABASE_URL")
+        token = os.environ.get("TURSO_AUTH_TOKEN")
+        if not url or not token:
+            print("[storage] TURSO_DATABASE_URL or TURSO_AUTH_TOKEN not set — disk-only mode")
             return
-        db_name = os.environ.get("MONGO_DB", "fx_intel")
         try:
-            self.client = MongoClient(
-                uri,
-                tlsCAFile=certifi.where(),
-                serverSelectionTimeoutMS=8000,
-            )
-            self.client.admin.command("ping")
-            self.db = self.client[db_name]
+            self.conn = libsql.connect(database=url, auth_token=token)
+            # Test the connection
+            self.conn.execute("SELECT 1")
             self.connected = True
-            print(f"[storage] Connected to MongoDB database '{db_name}'")
+            print(f"[storage] Connected to Turso database")
         except Exception as e:
             self.last_error = str(e)
-            print(f"[storage] Mongo connection failed: {e}")
-            self.client = None
-            self.db = None
-
-    @staticmethod
-    def _df_to_records(df):
-        if df is None or df.empty:
-            return []
-        records = df.to_dict(orient="records")
-        for rec in records:
-            for k, v in list(rec.items()):
-                if isinstance(v, pd.Timestamp):
-                    rec[k] = None if pd.isna(v) else v.strftime("%Y-%m-%d")
-                elif isinstance(v, (np.integer,)):
-                    rec[k] = int(v)
-                elif isinstance(v, (np.floating,)):
-                    rec[k] = None if (np.isnan(v) or np.isinf(v)) else float(v)
-                elif isinstance(v, float) and (math.isnan(v) or math.isinf(v)):
-                    rec[k] = None
-                elif isinstance(v, np.bool_):
-                    rec[k] = bool(v)
-        return records
+            print(f"[storage] Turso connection failed: {e}")
+            self.conn = None
 
     def save_snapshot(self, currency_df, pair_df):
         if not self.connected:
             return False
         try:
-            currency_records = self._df_to_records(currency_df)
-            pair_records = self._df_to_records(pair_df)
-            latest_report = (
-                currency_df["report_date"].max().strftime("%Y-%m-%d")
-                if currency_df is not None and not currency_df.empty else None
+            # Store DataFrames as Parquet blobs for efficient serialization
+            cur_buf = io.BytesIO()
+            currency_df.to_parquet(cur_buf, index=False)
+            pair_buf = io.BytesIO()
+            pair_df.to_parquet(pair_buf, index=False)
+
+            self.conn.execute("""
+                CREATE TABLE IF NOT EXISTS currency_snapshot (
+                    id INTEGER PRIMARY KEY,
+                    data BLOB,
+                    latest_report_date TEXT,
+                    updated_at TEXT
+                )
+            """)
+            self.conn.execute("""
+                CREATE TABLE IF NOT EXISTS pair_snapshot (
+                    id INTEGER PRIMARY KEY,
+                    data BLOB,
+                    updated_at TEXT
+                )
+            """)
+
+            now = datetime.utcnow().isoformat()
+            latest_report = currency_df["report_date"].max().strftime("%Y-%m-%d") if not currency_df.empty else None
+
+            self.conn.execute("DELETE FROM currency_snapshot WHERE id = 1")
+            self.conn.execute(
+                "INSERT INTO currency_snapshot (id, data, latest_report_date, updated_at) VALUES (?, ?, ?, ?)",
+                (1, cur_buf.getvalue(), latest_report, now)
             )
-            now = datetime.utcnow()
-            self.db.currency_history.replace_one(
-                {"_id": "snapshot"},
-                {"_id": "snapshot", "rows": currency_records,
-                 "row_count": len(currency_records),
-                 "latest_report_date": latest_report, "updated_at": now},
-                upsert=True,
+
+            self.conn.execute("DELETE FROM pair_snapshot WHERE id = 1")
+            self.conn.execute(
+                "INSERT INTO pair_snapshot (id, data, updated_at) VALUES (?, ?, ?)",
+                (1, pair_buf.getvalue(), now)
             )
-            self.db.pair_history.replace_one(
-                {"_id": "snapshot"},
-                {"_id": "snapshot", "rows": pair_records,
-                 "row_count": len(pair_records), "updated_at": now},
-                upsert=True,
-            )
-            self.db.metadata.replace_one(
-                {"_id": "status"},
-                {"_id": "status", "latest_report_date": latest_report,
-                 "updated_at": now,
-                 "currency_rows": len(currency_records),
-                 "pair_rows": len(pair_records)},
-                upsert=True,
-            )
-            print(f"[storage] Saved {len(currency_records)} currency rows, "
-                  f"{len(pair_records)} pair rows to Mongo")
+            self.conn.commit()
+            print(f"[storage] Saved snapshots to Turso (latest report: {latest_report})")
             return True
         except Exception as e:
             self.last_error = str(e)
@@ -340,23 +316,26 @@ class Storage:
         if not self.connected:
             return None, None, None
         try:
-            currency_doc = self.db.currency_history.find_one({"_id": "snapshot"})
-            pair_doc = self.db.pair_history.find_one({"_id": "snapshot"})
-            if not currency_doc or not pair_doc:
+            cur_res = self.conn.execute("SELECT data, latest_report_date, updated_at FROM currency_snapshot WHERE id = 1").fetchone()
+            pair_res = self.conn.execute("SELECT data, updated_at FROM pair_snapshot WHERE id = 1").fetchone()
+
+            if not cur_res or not pair_res:
                 return None, None, None
-            currency_df = pd.DataFrame(currency_doc["rows"])
-            pair_df = pd.DataFrame(pair_doc["rows"])
-            if not currency_df.empty and "report_date" in currency_df.columns:
+
+            cur_buf = io.BytesIO(cur_res[0])
+            currency_df = pd.read_parquet(cur_buf)
+            pair_buf = io.BytesIO(pair_res[0])
+            pair_df = pd.read_parquet(pair_buf)
+
+            # Ensure date columns are datetimes
+            if "report_date" in currency_df.columns:
                 currency_df["report_date"] = pd.to_datetime(currency_df["report_date"])
-                currency_df = currency_df.sort_values(
-                    ["currency", "report_date"]).reset_index(drop=True)
-            if not pair_df.empty and "report_date" in pair_df.columns:
+            if "report_date" in pair_df.columns:
                 pair_df["report_date"] = pd.to_datetime(pair_df["report_date"])
-                pair_df = pair_df.sort_values(
-                    ["pair", "report_date"]).reset_index(drop=True)
+
             meta = {
-                "updated_at": currency_doc.get("updated_at"),
-                "latest_report_date": currency_doc.get("latest_report_date"),
+                "latest_report_date": cur_res[1],
+                "updated_at": cur_res[2],
                 "currency_rows": len(currency_df),
                 "pair_rows": len(pair_df),
             }
@@ -369,10 +348,9 @@ class Storage:
     def info(self):
         return {
             "connected": self.connected,
-            "database": self.db.name if self.db is not None else None,
+            "database": "turso" if self.connected else None,
             "last_error": self.last_error,
         }
-
 
 CACHE = Cache()
 
